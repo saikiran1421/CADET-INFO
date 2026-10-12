@@ -1,0 +1,34 @@
+// Security test matrix. Runs the real server on a temp database:  npm test
+const test=require('node:test'),assert=require('node:assert/strict'),fs=require('fs'),os=require('os'),path=require('path'),{once}=require('events');
+process.env.DATA_DIR=fs.mkdtempSync(path.join(os.tmpdir(),'cadet-'));
+const {start,addUser}=require('./server');const PW='Test-pass-12345';let base;
+const call=async(who,method,url,body,form)=>{const h={'X-Requested-With':'cadetinfo'};if(who)h.cookie=who.cookie;let b=form;if(body){h['Content-Type']='application/json';b=JSON.stringify(body)}return fetch(base+url,{method,headers:h,body:b})};
+const login=async(id,portal)=>{const r=await call(null,'POST','/api/auth/login',{identifier:id,password:PW,portal});assert.equal(r.status,200);return {cookie:r.headers.getSetCookie()[0].split(';')[0]}};
+const pdf=mb=>Buffer.concat([Buffer.from('%PDF-1.4\n'),Buffer.alloc(Math.floor(mb*1024*1024)-9,32)]);
+const upload=(who,buf,name='cert.pdf')=>{const f=new FormData();f.set('certificate_type','Camp Certificate');f.set('file',new Blob([buf]),name);return call(who,'POST','/api/me/certificates',null,f)};
+test('CADET INFO security matrix',async t=>{
+  const {db}=require('./server');db.exec("INSERT INTO units(unit_name,battalion,institution) VALUES('Unit A','1 Bn','College A'),('Unit B','2 Bn','College B')");
+  const uA=1,uB=2,mk=(n,role,unit)=>addUser({name:n,email:n+'@x.test',password:PW,role,cadet_id:role==='CADET'?n:null,ano_id:role==='ANO'?n:null,unit_id:unit});
+  const ids={cA:mk('cadetA','CADET',uA),cB:mk('cadetB','CADET',uA),cC:mk('cadetC','CADET',uB)};mk('anoA','ANO',uA);mk('anoB','ANO',uB);
+  const S=server=>server;const server=start(0);await once(server,'listening');base='http://localhost:'+server.address().port;t.after(()=>server.close());
+  const A=await login('cadetA'),B=await login('cadetB'),C=await login('cadetC'),oA=await login('anoA','ano'),oB=await login('anoB','ano');
+  const camp=await call(B,'POST','/api/me/camps',{camp_name:'CATC 1',camp_type:'CATC',location:'Pune',from_date:'2026-01-01',to_date:'2026-01-10',status:'Completed',experience:'Great'});assert.equal(camp.status,201);const campB=(await camp.json()).id;
+  const certB=(await(await upload(B,pdf(0.1))).json()).id;
+  await t.test('Cadet A reads Cadet B profile via ANO endpoint -> DENY',async()=>assert.equal((await call(A,'GET','/api/ano/cadets/'+ids.cB)).status,403));
+  await t.test('Cadet A reads Cadet B certificate by ID -> DENY',async()=>assert.equal((await call(A,'GET','/api/certificates/'+certB+'/file')).status,404));
+  await t.test('Cadet A edits/deletes Cadet B camp by ID -> DENY',async()=>{assert.equal((await call(A,'PUT','/api/me/camps/'+campB,{camp_name:'x',camp_type:'CATC',location:'x',from_date:'2026-01-01',to_date:'2026-01-02',status:'Completed'})).status,404);assert.equal((await call(A,'DELETE','/api/me/camps/'+campB)).status,404);assert.equal((await call(A,'DELETE','/api/me/certificates/'+certB)).status,404)});
+  await t.test('Cadet cannot inject other cadet via body -> only own data changes',async()=>{await call(A,'PUT','/api/me/profile',{full_name:'A New',user_id:ids.cB,cadet_id:'cadetB',ncc_unit:'Unit B'});const b=await(await call(B,'GET','/api/me')).json();assert.notEqual(b.profile.full_name,'A New');assert.equal(b.profile.ncc_unit,'Unit A')});
+  await t.test('Cadet cannot use ANO export / stats -> DENY',async()=>{assert.equal((await call(A,'GET','/api/ano/export')).status,403);assert.equal((await call(A,'GET','/api/ano/stats')).status,403)});
+  await t.test('ANO of Unit A reads Unit B cadet / certificate -> DENY',async()=>{assert.equal((await call(oA,'GET','/api/ano/cadets/'+ids.cC)).status,404);const f=new FormData();f.set('certificate_type','Other');f.set('file',new Blob([pdf(0.01)]),'c.pdf');const cc=(await(await call(C,'POST','/api/me/certificates',null,f)).json()).id;assert.equal((await call(oA,'GET','/api/certificates/'+cc+'/file')).status,404)});
+  await t.test('Authorized ANO reads Unit A cadet + certificate -> ALLOW',async()=>{assert.equal((await call(oA,'GET','/api/ano/cadets/'+ids.cB)).status,200);const r=await call(oA,'GET','/api/certificates/'+certB+'/file');assert.equal(r.status,200);assert.equal(r.headers.get('content-type'),'application/pdf')});
+  await t.test('ANO list and export contain only own unit',async()=>{const l=await(await call(oA,'GET','/api/ano/cadets')).json();assert.deepEqual(l.map(c=>c.cadet_id).sort(),['cadetA','cadetB']);const csv=await(await call(oA,'GET','/api/ano/export?format=csv')).text();assert.ok(csv.includes('cadetA')&&!csv.includes('cadetC'));const ids2=await(await call(oA,'GET','/api/ano/export?format=csv&ids='+ids.cC)).text();assert.ok(!ids2.includes('cadetC'))});
+  await t.test('Cadet reads own profile -> ALLOW',async()=>assert.equal((await call(A,'GET','/api/me')).status,200));
+  await t.test('4.9 MB certificate -> ALLOW',async()=>assert.equal((await upload(A,pdf(4.9))).status,201));
+  await t.test('5.1 MB certificate -> DENY',async()=>{const r=await upload(A,pdf(5.1));assert.equal(r.status,413);assert.match((await r.json()).error,/5 MB/)});
+  await t.test('Fake file (exe renamed .pdf) / wrong extension -> DENY',async()=>{assert.equal((await upload(A,Buffer.from('MZ\x90\x00 evil'),'x.pdf')).status,400);assert.equal((await upload(A,pdf(0.01),'x.exe')).status,400)});
+  await t.test('Unauthenticated and CSRF-less requests -> DENY',async()=>{assert.equal((await call(null,'GET','/api/me')).status,401);assert.equal((await call(null,'GET','/api/certificates/'+certB+'/file')).status,401);const r=await fetch(base+'/api/me/camps',{method:'POST',headers:{cookie:A.cookie,'Content-Type':'application/json'},body:'{}'});assert.equal(r.status,403)});
+  await t.test('Camp days = To - From; invalid dates rejected',async()=>{const c=(await(await call(B,'GET','/api/me/camps')).json())[0];assert.equal(c.number_of_days,9);assert.equal((await call(B,'POST','/api/me/camps',{camp_name:'x',camp_type:'RDC',location:'y',from_date:'2026-02-05',to_date:'2026-02-01',status:'Completed'})).status,400)});
+  await t.test('Excel export is a valid .xlsx',async()=>{const r=await call(oA,'GET','/api/ano/export');assert.equal(r.status,200);const f=path.join(process.env.DATA_DIR,'t.xlsx');fs.writeFileSync(f,Buffer.from(await r.arrayBuffer()));const o=require('child_process').execSync(`python3 -c "import openpyxl;ws=openpyxl.load_workbook('${f}').active;print(ws.max_row,ws['A2'].value)"`).toString().trim();assert.match(o,/^3 cadet/)});
+  await t.test('Audit logs record ANO views/exports',async()=>{const n=db.prepare("SELECT COUNT(*) n FROM audit_log WHERE action IN('cadet_viewed','export_generated','certificate_viewed')").get().n;assert.ok(n>=3)});
+  await t.test('Brute force is rate limited',async()=>{let last;for(let i=0;i<10;i++)last=await call(null,'POST','/api/auth/login',{identifier:'cadetA',password:'wrong-pass',portal:'cadet'});assert.equal(last.status,429)});
+});

@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: cadet-info
+    runtime: docker
+    plan: starter            # a paid plan is required for a persistent disk (check Render pricing)
+    healthCheckPath: /
+    disk:
+      name: cadet-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATA_DIR
+        value: /data
+      - key: TRUST_PROXY
+        value: "1"
+      - key: SUPERADMIN_EMAIL      # you will be asked for this on deploy
+        sync: false
+      - key: SUPERADMIN_PASSWORD   # you will be asked for this on deploy (12+ random characters)
+        sync: false
+      - key: REGISTRATION_CODE     # a code you share with your cadets
+        sync: false

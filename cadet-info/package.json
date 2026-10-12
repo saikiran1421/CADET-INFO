@@ -1,0 +1,2 @@
+{"name":"cadet-info","version":"1.0.0","description":"CADET INFO - NCC Cadet Information Management System","main":"server.js","private":true,
+"engines":{"node":">=22.13"},"scripts":{"start":"node server.js","seed":"node seed.js","test":"node --test test.js"}}
